@@ -14,7 +14,21 @@ spec:
     singular: redis
   scope: Namespaced
   versions:
-  - name: v1beta2
+  - additionalPrinterColumns:
+    - description: The current state of the Redis
+      jsonPath: .status.state
+      name: State
+      type: string
+    - description: Age of Redis
+      jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    - description: The reason for the current state
+      jsonPath: .status.reason
+      name: Reason
+      priority: 1
+      type: string
+    name: v1beta2
     schema:
       openAPIV3Schema:
         description: Redis is the Schema for the redis API
@@ -114,10 +128,16 @@ spec:
                 type: object
               acl:
                 properties:
+                  persistentVolumeClaim:
+                    description: |-
+                      PersistentVolumeClaim-based ACL configuration
+                      Specify the PVC name to mount ACL file from persistent storage
+                      The operator will automatically mount /etc/redis/user.acl from the PVC
+                    type: string
                   secret:
                     description: |-
-                      Adapts a Secret into a volume.
-
+                      Secret-based ACL configuration.
+                      Adapts a Secret into a volume containing ACL rules.
                       The contents of the target Secret's Data field will be presented in a volume
                       as files using the keys in the Data field as the file names.
                       Secret volumes support ownership management and SELinux relabeling.
@@ -5382,6 +5402,11 @@ spec:
             type: object
           status:
             description: RedisStatus defines the observed state of Redis
+            properties:
+              reason:
+                type: string
+              state:
+                type: string
             type: object
         required:
         - spec

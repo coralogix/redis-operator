@@ -13,6 +13,36 @@ spec:
             file: secret.yaml
         - apply:
             file: ../../../../data-assert/resources.yaml
+        - apply:
+            file: ../../../../testdata/additional-config.yaml
+        - script:
+            timeout: 10s
+            content: |
+              cat <<EOF | kubectl apply -f -
+              ---
+              apiVersion: cert-manager.io/v1
+              kind: Issuer
+              metadata:
+                name: selfsigned-issuer
+                namespace: ${NAMESPACE}
+              spec:
+                selfSigned: {}
+              ---
+              apiVersion: cert-manager.io/v1
+              kind: Certificate
+              metadata:
+                name: redis-tls
+                namespace: ${NAMESPACE}
+              spec:
+                commonName: redis-cluster-v1beta2
+                dnsNames:
+                  - "*.redis-cluster-v1beta2-leader-headless.${NAMESPACE}.svc.cluster.local"
+                  - "*.redis-cluster-v1beta2-follower-headless.${NAMESPACE}.svc.cluster.local"
+                issuerRef:
+                  name: selfsigned-issuer
+                  kind: Issuer
+                secretName: redis-tls-cert
+              EOF
         - assert:
             file: ready-cluster.yaml
         - assert:
@@ -24,7 +54,7 @@ spec:
         - assert:
             file: secret.yaml
 
-    - name: Random Check Dynamic Config
+    - name: Assert config
       try:
         - script:
             timeout: 30s
@@ -40,19 +70,29 @@ spec:
 
               # Check leader configuration
               LEADER_CMD="kubectl exec -n ${NAMESPACE} redis-cluster-v1beta2-leader-${LEADER_INDEX}"
-              LEADER_CMD="${LEADER_CMD} -c redis-cluster-v1beta2-leader -- redis-cli -a Opstree1234"
+              LEADER_CMD="${LEADER_CMD} -c redis-cluster-v1beta2-leader -- redis-cli --no-auth-warning -a Opstree1234 --tls --cacert /tls/ca.crt"
               SLOWLOG_VALUE=$(${LEADER_CMD} config get slowlog-log-slower-than | grep -A1 "slowlog-log-slower-than" | tail -n1)
+              TCP_KEEPALIVE_VALUE=$(${LEADER_CMD} config get tcp-keepalive | grep -A1 "tcp-keepalive" | tail -n1)
               if [ "$SLOWLOG_VALUE" != "5000" ]; then
                 echo "leader-${LEADER_INDEX} slowlog-log-slower-than value is $SLOWLOG_VALUE, expected 5000"
+                exit 1
+              fi
+              if [ "$TCP_KEEPALIVE_VALUE" != "400" ]; then
+                echo "leader-${LEADER_INDEX} tcp-keepalive value is $TCP_KEEPALIVE_VALUE, expected 400"
                 exit 1
               fi
 
               # Check follower configuration
               FOLLOWER_CMD="kubectl exec -n ${NAMESPACE} redis-cluster-v1beta2-follower-${FOLLOWER_INDEX}"
-              FOLLOWER_CMD="${FOLLOWER_CMD} -c redis-cluster-v1beta2-follower -- redis-cli -a Opstree1234"
+              FOLLOWER_CMD="${FOLLOWER_CMD} -c redis-cluster-v1beta2-follower -- redis-cli --no-auth-warning -a Opstree1234 --tls --cacert /tls/ca.crt"
               SLOWLOG_VALUE=$(${FOLLOWER_CMD} config get slowlog-log-slower-than | grep -A1 "slowlog-log-slower-than" | tail -n1)
+              TCP_KEEPALIVE_VALUE=$(${FOLLOWER_CMD} config get tcp-keepalive | grep -A1 "tcp-keepalive" | tail -n1)
               if [ "$SLOWLOG_VALUE" != "5000" ]; then
                 echo "follower-${FOLLOWER_INDEX} slowlog-log-slower-than value is $SLOWLOG_VALUE, expected 5000"
+                exit 1
+              fi
+              if [ "$TCP_KEEPALIVE_VALUE" != "400" ]; then
+                echo "follower-${LEADER_INDEX} tcp-keepalive value is $TCP_KEEPALIVE_VALUE, expected 400"
                 exit 1
               fi
 
@@ -71,7 +111,7 @@ spec:
 
               # maxmemory should not equal to 0
               MAXMEMORY=$(kubectl exec -n ${NAMESPACE} redis-cluster-v1beta2-leader-0 -c redis-cluster-v1beta2-leader -- \
-              redis-cli --no-auth-warning -a Opstree1234 config get maxmemory | grep -A1 "maxmemory" | tail -n1)
+              redis-cli --no-auth-warning --tls --cacert /tls/ca.crt -a Opstree1234 config get maxmemory | grep -A1 "maxmemory" | tail -n1)
               if [ "$MAXMEMORY" == "0" ]; then
                 echo "maxmemory value is $MAXMEMORY, expected not 0"
                 exit 1
@@ -84,7 +124,7 @@ spec:
             timeout: 30s
             content: >
               kubectl exec --namespace ${NAMESPACE} --container data-assert data-assert --
-              bash -c  "cd /go/src/data-assert && go run main.go gen-redis-data --host redis-cluster-v1beta2-leader.${NAMESPACE}.svc.cluster.local:6379 --mode cluster --password Opstree1234"
+              bash -c  "cd /go/src/data-assert && go run main.go gen-redis-data --host redis-cluster-v1beta2-leader.${NAMESPACE}.svc.cluster.local:6379 --mode cluster --password Opstree1234 --tls"
             check:
               (contains($stdout, 'OK')): true
 
@@ -94,7 +134,7 @@ spec:
             timeout: 30s
             content: >
               kubectl exec --namespace ${NAMESPACE} redis-cluster-v1beta2-follower-0 -c redis-cluster-v1beta2-follower --
-              bash -c  "redis-cli -a Opstree1234 cluster failover"
+              bash -c  "redis-cli -a Opstree1234 --tls --cacert /tls/ca.crt cluster failover"
             check:
               (contains($stdout, 'OK')): true
 
@@ -115,7 +155,7 @@ spec:
             timeout: 30s
             content: >
               kubectl exec --namespace ${NAMESPACE} redis-cluster-v1beta2-leader-0 -c redis-cluster-v1beta2-leader --
-              bash -c  "redis-cli -a Opstree1234 cluster failover"
+              bash -c  "redis-cli -a Opstree1234 --tls --cacert /tls/ca.crt cluster failover"
             check:
               (contains($stdout, 'OK')): true
         - sleep:
@@ -152,7 +192,7 @@ spec:
             timeout: 30s
             content: >
               kubectl exec --namespace ${NAMESPACE} --container data-assert data-assert --
-              bash -c "cd /go/src/data-assert && go run main.go chk-redis-data --host redis-cluster-v1beta2-leader.${NAMESPACE}.svc.cluster.local:6379 --mode cluster --password Opstree1234"
+              bash -c "cd /go/src/data-assert && go run main.go chk-redis-data --host redis-cluster-v1beta2-leader.${NAMESPACE}.svc.cluster.local:6379 --mode cluster --password Opstree1234 --tls"
             check:
               (contains($stdout, 'OK')): true
 
@@ -169,7 +209,7 @@ spec:
             timeout: 30s
             content: >
               kubectl exec --namespace ${NAMESPACE} --container data-assert data-assert --
-              bash -c "cd /go/src/data-assert && go run main.go chk-redis-data --host redis-cluster-v1beta2-leader.${NAMESPACE}.svc.cluster.local:6379 --mode cluster --password Opstree1234"
+              bash -c "cd /go/src/data-assert && go run main.go chk-redis-data --host redis-cluster-v1beta2-leader.${NAMESPACE}.svc.cluster.local:6379 --mode cluster --password Opstree1234 --tls"
             check:
               (contains($stdout, 'OK')): true
 

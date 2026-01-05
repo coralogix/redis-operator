@@ -11,9 +11,8 @@ import (
 	commonapi "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/consts"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common"
-	internalenv "github.com/OT-CONTAINER-KIT/redis-operator/internal/env"
+	"github.com/OT-CONTAINER-KIT/redis-operator/internal/envs"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/features"
-	"github.com/OT-CONTAINER-KIT/redis-operator/internal/image"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/util"
 	"github.com/banzaicloud/k8s-objectmatcher/patch"
 	"github.com/pkg/errors"
@@ -22,7 +21,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/utils/env"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -60,10 +58,23 @@ func (s *StatefulSetService) IsStatefulSetReady(ctx context.Context, namespace, 
 	if sts.Spec.Replicas != nil {
 		replicas = int(*sts.Spec.Replicas)
 	}
-
+	if sts.Spec.UpdateStrategy.Type == appsv1.OnDeleteStatefulSetStrategyType {
+		// For OnDelete, we just check if the pods are ready
+		if int(sts.Status.ReadyReplicas) != replicas {
+			log.FromContext(ctx).V(1).Info("StatefulSet is not ready", "Status.ReadyReplicas", sts.Status.ReadyReplicas, "Replicas", replicas)
+			return false
+		}
+		return true
+	}
 	if expectedUpdateReplicas := replicas - partition; sts.Status.UpdatedReplicas < int32(expectedUpdateReplicas) {
-		log.FromContext(ctx).V(1).Info("StatefulSet is not ready", "Status.UpdatedReplicas", sts.Status.UpdatedReplicas, "ExpectedUpdateReplicas", expectedUpdateReplicas)
-		return false
+		if int(sts.Status.ReadyReplicas) == replicas {
+			// When we cannot update statefulset due to immutability, we delete it with cascade=false and recreate it
+			// This causes UpdatedReplicas to be 0, despite pod being ready
+			log.FromContext(ctx).V(1).Info("StatefulSet has been recreated", "ObservedGeneration", sts.Status.ObservedGeneration, "Generation", sts.Generation)
+		} else {
+			log.FromContext(ctx).V(1).Info("StatefulSet is not ready", "Status.UpdatedReplicas", sts.Status.UpdatedReplicas, "ExpectedUpdateReplicas", expectedUpdateReplicas)
+			return false
+		}
 	}
 	if partition == 0 && sts.Status.CurrentRevision != sts.Status.UpdateRevision {
 		log.FromContext(ctx).V(1).Info("StatefulSet is not ready", "Status.CurrentRevision", sts.Status.CurrentRevision, "Status.UpdateRevision", sts.Status.UpdateRevision)
@@ -314,7 +325,7 @@ func generateStatefulSetsDef(stsMeta metav1.ObjectMeta, params statefulSetParame
 		},
 	}
 
-	statefulset.Spec.Template.Spec.InitContainers = generateInitContainerDef(containerParams.Role, stsMeta.GetName(), initcontainerParams, initcontainerParams.AdditionalMountPath, containerParams, params.ClusterVersion)
+	statefulset.Spec.Template.Spec.InitContainers = generateInitContainerDef(containerParams.Role, stsMeta.GetName(), initcontainerParams, params.ExternalConfig, initcontainerParams.AdditionalMountPath, containerParams, params.ClusterVersion)
 
 	if params.Tolerations != nil {
 		statefulset.Spec.Template.Spec.Tolerations = *params.Tolerations
@@ -326,11 +337,11 @@ func generateStatefulSetsDef(stsMeta metav1.ObjectMeta, params statefulSetParame
 		statefulset.Spec.VolumeClaimTemplates = append(statefulset.Spec.VolumeClaimTemplates, createPVCTemplate("node-conf", stsMeta, params.NodeConfPersistentVolumeClaim))
 	}
 	if containerParams.PersistenceEnabled != nil && *containerParams.PersistenceEnabled {
-		pvcTplName := env.GetString(common.EnvOperatorSTSPVCTemplateName, stsMeta.GetName())
+		pvcTplName := util.CoalesceEnv1(common.EnvOperatorSTSPVCTemplateName, stsMeta.GetName())
 		statefulset.Spec.VolumeClaimTemplates = append(statefulset.Spec.VolumeClaimTemplates, createPVCTemplate(pvcTplName, stsMeta, params.PersistentVolumeClaim))
 	}
 	if params.ExternalConfig != nil {
-		statefulset.Spec.Template.Spec.Volumes = getExternalConfig(*params.ExternalConfig)
+		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, getExternalConfig(*params.ExternalConfig)...)
 	}
 	if containerParams.AdditionalVolume != nil {
 		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, containerParams.AdditionalVolume...)
@@ -346,14 +357,26 @@ func generateStatefulSetsDef(stsMeta metav1.ObjectMeta, params statefulSetParame
 			})
 	}
 
-	if containerParams.ACLConfig != nil && containerParams.ACLConfig.Secret != nil {
-		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes,
-			corev1.Volume{
-				Name: "acl-secret",
-				VolumeSource: corev1.VolumeSource{
-					Secret: containerParams.ACLConfig.Secret,
-				},
-			})
+	if containerParams.ACLConfig != nil {
+		if containerParams.ACLConfig.Secret != nil {
+			statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes,
+				corev1.Volume{
+					Name: "acl-secret",
+					VolumeSource: corev1.VolumeSource{
+						Secret: containerParams.ACLConfig.Secret,
+					},
+				})
+		} else if containerParams.ACLConfig.PersistentVolumeClaim != nil {
+			statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes,
+				corev1.Volume{
+					Name: "acl-pvc",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: *containerParams.ACLConfig.PersistentVolumeClaim,
+						},
+					},
+				})
+		}
 	}
 
 	if params.ServiceAccountName != nil {
@@ -571,11 +594,10 @@ if [ "$ROLE" = "master" ]; then
 fi`, authArgs, tlsArgs, authArgs, tlsArgs, authArgs, tlsArgs)
 }
 
-func generateInitContainerDef(role, name string, initcontainerParams initContainerParameters, mountpath []corev1.VolumeMount, containerParams containerParameters, clusterVersion *string) []corev1.Container {
+func generateInitContainerDef(role, name string, initcontainerParams initContainerParameters, externalConfig *string, mountpath []corev1.VolumeMount, containerParams containerParameters, clusterVersion *string) []corev1.Container {
 	containers := []corev1.Container{}
 
 	if features.Enabled(features.GenerateConfigInInitContainer) {
-		image, _ := util.CoalesceEnv(internalenv.OperatorImageEnv, image.GetOperatorImage())
 		// give all container env vars to init container
 		envVars := append(
 			ptr.Deref(containerParams.EnvVars, []corev1.EnvVar{}),
@@ -591,11 +613,20 @@ func generateInitContainerDef(role, name string, initcontainerParams initContain
 				})
 			}
 		}
+
+		VolumeMounts := []corev1.VolumeMount{
+			generateConfigVolumeMount(common.VolumeNameConfig),
+		}
+		if externalConfig != nil {
+			VolumeMounts = append(VolumeMounts, externalConfigMount)
+		}
+
 		container := corev1.Container{
 			Name:            "init-config",
-			Image:           image,
+			Image:           envs.GetInitContainerImage(),
 			ImagePullPolicy: corev1.PullIfNotPresent,
 			Command:         []string{"/operator", "agent"},
+			SecurityContext: initcontainerParams.SecurityContext,
 			Env: getEnvironmentVariables(
 				containerParams.Role,
 				containerParams.EnabledPassword,
@@ -608,9 +639,11 @@ func generateInitContainerDef(role, name string, initcontainerParams initContain
 				containerParams.Port,
 				clusterVersion,
 			),
-			VolumeMounts: []corev1.VolumeMount{
-				generateConfigVolumeMount(common.VolumeNameConfig),
-			},
+			VolumeMounts: VolumeMounts,
+		}
+		// Set init-config resources to match main container if present
+		if containerParams.Resources != nil {
+			container.Resources = *containerParams.Resources
 		}
 		if role == "sentinel" {
 			container.Args = []string{"bootstrap", "--sentinel"}
@@ -754,6 +787,11 @@ func getExporterEnvironmentVariables(params containerParameters) []corev1.EnvVar
 	return envVars
 }
 
+var externalConfigMount = corev1.VolumeMount{
+	Name:      "external-config",
+	MountPath: "/etc/redis/external.conf.d",
+}
+
 // getVolumeMount gives information about persistence mount
 func getVolumeMount(name string, persistenceEnabled *bool, clusterMode bool, nodeConfVolume bool, externalConfig *string, mountpath []corev1.VolumeMount, tlsConfig *commonapi.TLSConfig, aclConfig *commonapi.ACLConfig) []corev1.VolumeMount {
 	var VolumeMounts []corev1.VolumeMount
@@ -767,7 +805,7 @@ func getVolumeMount(name string, persistenceEnabled *bool, clusterMode bool, nod
 
 	if persistenceEnabled != nil && *persistenceEnabled {
 		VolumeMounts = append(VolumeMounts, corev1.VolumeMount{
-			Name:      env.GetString(common.EnvOperatorSTSPVCTemplateName, name),
+			Name:      util.CoalesceEnv1(common.EnvOperatorSTSPVCTemplateName, name),
 			MountPath: "/data",
 		})
 	}
@@ -781,18 +819,19 @@ func getVolumeMount(name string, persistenceEnabled *bool, clusterMode bool, nod
 	}
 
 	if aclConfig != nil {
+		volumeName := "acl-secret"
+		if aclConfig.PersistentVolumeClaim != nil {
+			volumeName = "acl-pvc"
+		}
 		VolumeMounts = append(VolumeMounts, corev1.VolumeMount{
-			Name:      "acl-secret",
+			Name:      volumeName,
 			MountPath: "/etc/redis/user.acl",
 			SubPath:   "user.acl",
 		})
 	}
 
 	if externalConfig != nil {
-		VolumeMounts = append(VolumeMounts, corev1.VolumeMount{
-			Name:      "external-config",
-			MountPath: "/etc/redis/external.conf.d",
-		})
+		VolumeMounts = append(VolumeMounts, externalConfigMount)
 	}
 
 	if features.Enabled(features.GenerateConfigInInitContainer) {
@@ -805,30 +844,38 @@ func getVolumeMount(name string, persistenceEnabled *bool, clusterMode bool, nod
 }
 
 // getProbeInfo generate probe for Redis StatefulSet
+// The `ping` command will exit successfully even if the node is loading,
+// so we need to verify that the Redis `ping` command returns "PONG".
 func getProbeInfo(probe *corev1.Probe, sentinel, enableTLS, enableAuth bool) *corev1.Probe {
 	if probe == nil {
 		probe = &corev1.Probe{}
 	}
 	if probe.Exec == nil && probe.HTTPGet == nil && probe.TCPSocket == nil && probe.GRPC == nil {
-		healthChecker := []string{
+		redisHealthCheck := []string{
 			"redis-cli",
 			"-h", "$(hostname)",
 		}
 		if sentinel {
-			healthChecker = append(healthChecker, "-p", "${SENTINEL_PORT}")
+			redisHealthCheck = append(redisHealthCheck, "-p", "${SENTINEL_PORT}")
 		} else {
-			healthChecker = append(healthChecker, "-p", "${REDIS_PORT}")
+			redisHealthCheck = append(redisHealthCheck, "-p", "${REDIS_PORT}")
 		}
 		if enableAuth {
-			healthChecker = append(healthChecker, "-a", "${REDIS_PASSWORD}")
+			redisHealthCheck = append(redisHealthCheck, "-a", "${REDIS_PASSWORD}")
 		}
 		if enableTLS {
-			healthChecker = append(healthChecker, "--tls", "--cert", "${REDIS_TLS_CERT}", "--key", "${REDIS_TLS_CERT_KEY}", "--cacert", "${REDIS_TLS_CA_KEY}")
+			redisHealthCheck = append(redisHealthCheck, "--tls", "--cert", "${REDIS_TLS_CERT}", "--key", "${REDIS_TLS_CERT_KEY}", "--cacert", "${REDIS_TLS_CA_KEY}")
 		}
-		healthChecker = append(healthChecker, "ping")
+		redisHealthCheck = append(redisHealthCheck, "ping")
+
+		redisHealthCheckSubshell := strings.Join(redisHealthCheck, " ")
+
+		healthCheckScript := "RESP=\"$(" + redisHealthCheckSubshell + ")\"\n" + "[ \"$RESP\" = \"PONG\" ]"
+
+		// `-e` causes the shell to exit immediately if a (nontested) command fails
 		probe.ProbeHandler = corev1.ProbeHandler{
 			Exec: &corev1.ExecAction{
-				Command: []string{"sh", "-c", strings.Join(healthChecker, " ")},
+				Command: []string{"sh", "-ec", healthCheckScript},
 			},
 		}
 	}

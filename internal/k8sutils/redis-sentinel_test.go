@@ -281,6 +281,16 @@ func Test_generateRedisSentinelInitContainerParams(t *testing.T) {
 				SubPathExpr: "",
 			},
 		},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser:                ptr.To(int64(1000)),
+			RunAsGroup:               ptr.To(int64(1000)),
+			AllowPrivilegeEscalation: ptr.To(false),
+			ReadOnlyRootFilesystem:   ptr.To(true),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+				Add:  []corev1.Capability{"NET_BIND_SERVICE"},
+			},
+		},
 	}
 
 	data, err := os.ReadFile(path)
@@ -325,15 +335,17 @@ func Test_getSentinelEnvVariable(t *testing.T) {
 					Spec: rsvb2.RedisSentinelSpec{
 						RedisSentinelConfig: &rsvb2.RedisSentinelConfig{
 							RedisSentinelConfig: common.RedisSentinelConfig{
-								RedisReplicationName:  "redis-replication",
-								MasterGroupName:       "master",
-								RedisPort:             "6379",
-								Quorum:                "2",
-								DownAfterMilliseconds: "30000",
-								ParallelSyncs:         "1",
-								FailoverTimeout:       "180000",
-								ResolveHostnames:      "no",
-								AnnounceHostnames:     "no",
+								RedisReplicationName: "redis-replication",
+								MasterGroupName:      "master",
+								RedisPort:            "6379",
+								SentinelConfig: common.SentinelConfig{
+									Quorum:                "2",
+									DownAfterMilliseconds: "30000",
+									ParallelSyncs:         "1",
+									FailoverTimeout:       "180000",
+									ResolveHostnames:      "no",
+									AnnounceHostnames:     "no",
+								},
 							},
 						},
 					},
