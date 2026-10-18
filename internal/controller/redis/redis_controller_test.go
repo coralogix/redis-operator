@@ -102,6 +102,68 @@ var _ = Describe("Redis Controller", func() {
 		})
 	})
 
+	Context("When reporting the Redis status", func() {
+		const name = "redis-status-test"
+
+		var redis *rvb2.Redis
+
+		BeforeEach(func() {
+			redis = &rvb2.Redis{
+				ObjectMeta: testutil.CreateTestObject(name, ns, nil),
+				Spec: rvb2.RedisSpec{
+					KubernetesConfig: common.KubernetesConfig{
+						Image: testutil.DefaultRedisImage,
+					},
+				},
+			}
+			Expect(k8sClient.Create(context.Background(), redis)).Should(Succeed())
+		})
+
+		AfterEach(func() {
+			Expect(k8sClient.Delete(context.Background(), redis)).Should(Succeed())
+		})
+
+		getState := func() (rvb2.RedisState, string) {
+			current := &rvb2.Redis{}
+			err := k8sClient.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, current)
+			Expect(err).NotTo(HaveOccurred())
+			return current.Status.State, current.Status.Reason
+		}
+
+		It("should report Initializing, then Ready once the StatefulSet is ready", func() {
+			By("reporting Initializing while the StatefulSet is not ready")
+			Eventually(func() rvb2.RedisState {
+				state, _ := getState()
+				return state
+			}, timeout, interval).Should(Equal(rvb2.RedisInitializing))
+			_, reason := getState()
+			Expect(reason).To(Equal(rvb2.InitializingReason))
+
+			By("marking the StatefulSet as ready, as the StatefulSet controller would")
+			Eventually(func() error {
+				sts := &appsv1.StatefulSet{}
+				if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, sts); err != nil {
+					return err
+				}
+				sts.Status.ObservedGeneration = sts.Generation
+				sts.Status.Replicas = 1
+				sts.Status.ReadyReplicas = 1
+				sts.Status.UpdatedReplicas = 1
+				sts.Status.CurrentRevision = "rev-1"
+				sts.Status.UpdateRevision = "rev-1"
+				return k8sClient.Status().Update(context.Background(), sts)
+			}, timeout, interval).Should(Succeed())
+
+			By("reporting Ready")
+			Eventually(func() rvb2.RedisState {
+				state, _ := getState()
+				return state
+			}, timeout, interval).Should(Equal(rvb2.RedisReady))
+			_, reason = getState()
+			Expect(reason).To(Equal(rvb2.ReadyReason))
+		})
+	})
+
 	Context("When testing skip-reconcile annotation behavior", func() {
 		It("should trigger reconcile when skip-reconcile annotation changes from true to false", func() {
 			testutil.RunSkipReconcileTest(k8sClient, testutil.SkipReconcileTestConfig{
